@@ -1,3 +1,10 @@
+// github-forge entrypoint: a single Node 22 process built on the standard library alone.
+// It boots the forge from app.ts, lets the operating system choose a free port,
+// reports that port to the trial environment, then waits until the environment
+// signals the trial is finished before shutting down and exiting.
+// The forge answers git, REST, GraphQL and MCP requests from its own store;
+// it reaches out to nothing else while the trial runs.
+// The entrypoint owns only this lifecycle; the server itself lives in app.ts.
 // The entry <-> env lifecycle, as env/src/wire.ts settles it: bind an ephemeral port, tell the env the
 // port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
 // the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
