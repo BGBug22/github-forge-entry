@@ -101,6 +101,14 @@ export interface Repo {
   nextNumber: number;
   /** Cached serialised JSON for the hot read path; null after any mutation. */
   cachedJson: string | null;
+  /**
+   * Monotone revision of the git object/ref graph; bumped by touchGit() on
+   * every mutation. Git smart-HTTP responses cached in gitCache are valid
+   * only for the current revision (the cache is cleared on every bump).
+   */
+  gitRev: number;
+  /** Cached git smart-HTTP response bodies, keyed by request; see touchGit(). */
+  gitCache: Map<string, Buffer>;
 }
 
 export class Store {
@@ -128,6 +136,8 @@ export class Store {
       pulls: [],
       nextNumber: 1,
       cachedJson: null,
+      gitRev: 0,
+      gitCache: new Map(),
     };
     this.repos.set(key, repo);
     return repo;
@@ -158,6 +168,18 @@ export class Store {
 }
 
 export const store = new Store();
+
+/**
+ * Invalidate cached git smart-HTTP responses after the repo's object/ref
+ * graph changes. Call after every objects/refs mutation (receive-pack,
+ * commitTree, git/refs create, merge). The cache is per-Repo object, so a
+ * deleted-and-recreated repo starts empty anyway; the bump also lets a
+ * reader tell at a glance whether the graph moved since a response was built.
+ */
+export function touchGit(repo: Repo): void {
+  repo.gitRev += 1;
+  if (repo.gitCache.size > 0) repo.gitCache.clear();
+}
 
 /** Opaque global id for GraphQL `node` round-trips: base64 of a kind tag + ids. */
 export function globalId(kind: string, ...parts: (string | number)[]): string {

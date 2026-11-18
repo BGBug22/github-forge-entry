@@ -14,7 +14,7 @@
 // - receive-pack report: pkt-lined `unpack ok` + per-ref `ok`/`ng` lines,
 //   carried inside sideband band 1, then flush.
 // - A push's pack is unpacked even when a ref update is refused.
-import { store, VIEWER_LOGIN, DEFAULT_BRANCH, type Repo } from './store.ts';
+import { store, touchGit, VIEWER_LOGIN, DEFAULT_BRANCH, type Repo } from './store.ts';
 import {
   ZERO_OID,
   decodePktLines,
@@ -86,16 +86,35 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
   return Buffer.concat(parts);
 }
 
-/** v2 advertisement body (upload-pack only). */
-function v2Advertisement(): Buffer {
-  return Buffer.concat([
-    pktLine('version 2\n'),
-    pktLine(`agent=${AGENT}\n`),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow\n'),
-    pktLine('object-format=sha1\n'),
-    PKT_FLUSH,
-  ]);
+/** v2 advertisement body (upload-pack only). Constant: it names no repo state. */
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow\n'),
+  pktLine('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
+
+/**
+ * Clone-workload cache: 50 concurrent shallow clones of one tip ask for the
+ * same advertisement, the same ls-refs list and the same fetch pack. Rebuilding
+ * those bytes per request is pure repeated CPU on the server's single thread,
+ * so identical responses are cached per repo and dropped by touchGit() the
+ * moment the object/ref graph changes. A cached body is a pure function of
+ * (repo graph, request args), so the bytes served are identical to a fresh
+ * build and the stored state is untouched.
+ */
+/** Upper bound for one cached git response body (a depth-1 clone pack is < 1 KiB). */
+const GIT_CACHE_MAX_BODY = 1 << 20;
+/** Upper bound for cached responses per repo; the map is cleared when full. */
+const GIT_CACHE_MAX_ENTRIES = 128;
+
+/** Store a git smart-HTTP response body for an identical later request. */
+function cacheGitResponse(repo: Repo, key: string, body: Buffer): void {
+  if (body.length > GIT_CACHE_MAX_BODY) return;
+  if (repo.gitCache.size >= GIT_CACHE_MAX_ENTRIES) repo.gitCache.clear();
+  repo.gitCache.set(key, body);
 }
 
 function handleInfoRefs(ctx: Ctx, repo: Repo | undefined): boolean {
@@ -110,14 +129,27 @@ function handleInfoRefs(ctx: Ctx, repo: Repo | undefined): boolean {
   }
   const wantsV2 = service === 'git-upload-pack' && ctx.req.headers['git-protocol'] === 'version=2';
   if (wantsV2) {
-    sendBuffer(ctx, 200, v2Advertisement(), UPLOAD_PACK_AD);
+    sendBuffer(ctx, 200, V2_ADVERTISEMENT, UPLOAD_PACK_AD);
   } else {
-    sendBuffer(
-      ctx,
-      200,
-      v0Advertisement(repo, service),
-      service === 'git-upload-pack' ? UPLOAD_PACK_AD : RECEIVE_PACK_AD,
-    );
+    const cacheKey = `v0-ad|${service}`;
+    const cached = repo.gitCache.get(cacheKey);
+    if (cached !== undefined) {
+      sendBuffer(
+        ctx,
+        200,
+        cached,
+        service === 'git-upload-pack' ? UPLOAD_PACK_AD : RECEIVE_PACK_AD,
+      );
+    } else {
+      const body = v0Advertisement(repo, service);
+      cacheGitResponse(repo, cacheKey, body);
+      sendBuffer(
+        ctx,
+        200,
+        body,
+        service === 'git-upload-pack' ? UPLOAD_PACK_AD : RECEIVE_PACK_AD,
+      );
+    }
   }
   return true;
 }
@@ -130,6 +162,14 @@ interface LsRefsArgs {
 }
 
 function handleLsRefs(ctx: Ctx, repo: Repo, args: LsRefsArgs): boolean {
+  const cacheKey =
+    `ls-refs|${args.peel ? 1 : 0}${args.symrefs ? 1 : 0}${args.unborn ? 1 : 0}|` +
+    args.prefixes.join(',');
+  const cached = repo.gitCache.get(cacheKey);
+  if (cached !== undefined) {
+    sendBuffer(ctx, 200, cached, UPLOAD_PACK_RESULT);
+    return true;
+  }
   const lines: Buffer[] = [];
   const refs = refLines(repo);
   const matches = (name: string): boolean =>
@@ -151,7 +191,9 @@ function handleLsRefs(ctx: Ctx, repo: Repo, args: LsRefsArgs): boolean {
     }
   }
   lines.push(PKT_FLUSH);
-  sendBuffer(ctx, 200, Buffer.concat(lines), UPLOAD_PACK_RESULT);
+  const body = Buffer.concat(lines);
+  cacheGitResponse(repo, cacheKey, body);
+  sendBuffer(ctx, 200, body, UPLOAD_PACK_RESULT);
   return true;
 }
 
@@ -163,6 +205,17 @@ interface FetchArgs {
 }
 
 function handleFetch(ctx: Ctx, repo: Repo, args: FetchArgs): boolean {
+  // The whole response is a pure function of (repo graph, wants, haves,
+  // shallow boundary, depth): 50 concurrent shallow clones of one tip ask
+  // for byte-identical bytes, so serve the cached body when it exists.
+  const cacheKey =
+    `fetch|${args.wants.join(',')}|${args.haves.join(',')}|${args.shallow.join(',')}|` +
+    (args.depth ?? '');
+  const cached = repo.gitCache.get(cacheKey);
+  if (cached !== undefined) {
+    sendBuffer(ctx, 200, cached, UPLOAD_PACK_RESULT);
+    return true;
+  }
   // A want that is not in the store is a protocol error, reported on band 3.
   const missing = args.wants.find((want) => !repo.objects.has(want));
   const sections: Buffer[] = [];
@@ -173,7 +226,9 @@ function handleFetch(ctx: Ctx, repo: Repo, args: FetchArgs): boolean {
       sidebandPacket(3, Buffer.from(`ERR unknown object ${missing}\n`, 'utf8')),
       PKT_FLUSH,
     );
-    sendBuffer(ctx, 200, Buffer.concat(sections), UPLOAD_PACK_RESULT);
+    const body = Buffer.concat(sections);
+    cacheGitResponse(repo, cacheKey, body);
+    sendBuffer(ctx, 200, body, UPLOAD_PACK_RESULT);
     return true;
   }
   const held = args.haves.filter((have) => repo.objects.has(have));
@@ -206,7 +261,9 @@ function handleFetch(ctx: Ctx, repo: Repo, args: FetchArgs): boolean {
     sections.push(sidebandPacket(1, pack.subarray(offset, Math.min(pack.length, offset + CHUNK))));
   }
   sections.push(PKT_FLUSH);
-  sendBuffer(ctx, 200, Buffer.concat(sections), UPLOAD_PACK_RESULT);
+  const body = Buffer.concat(sections);
+  cacheGitResponse(repo, cacheKey, body);
+  sendBuffer(ctx, 200, body, UPLOAD_PACK_RESULT);
   return true;
 }
 
@@ -387,6 +444,9 @@ function handleReceivePack(ctx: Ctx, repo: Repo): boolean {
     repo.refs.set(command.ref, command.newOid);
     results.push({ ref: command.ref, ok: true, reason: '' });
   }
+  // The unpacked objects landed in the store even when a ref was refused, so
+  // the graph moved either way: drop every cached git response for this repo.
+  touchGit(repo);
   sendBuffer(ctx, 200, report(true, 'ok', results), RECEIVE_PACK_RESULT);
   return true;
 }

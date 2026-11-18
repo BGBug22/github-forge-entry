@@ -19,6 +19,7 @@
 // - a repo under another owner is 404, never 403.
 import {
   store,
+  touchGit,
   VIEWER_LOGIN,
   VIEWER_NAME,
   VIEWER_EMAIL,
@@ -223,6 +224,8 @@ function commitTree(
   repo.objects.set(oid, object);
   repo.refs.set(`refs/heads/${branch}`, oid);
   repo.cachedJson = null;
+  // The tree build above also stored tree objects: the git graph moved.
+  touchGit(repo);
   return oid;
 }
 
@@ -485,6 +488,7 @@ function handleRepoRoute(ctx: Ctx, repo: Repo, tail: string): boolean {
       if (!repo.objects.has(body.sha)) return sendError(ctx, 422, 'object does not exist'), true;
       if (repo.refs.has(body.ref)) return sendError(ctx, 422, 'reference already exists'), true;
       repo.refs.set(body.ref, body.sha);
+      touchGit(repo);
       return sendJson(ctx, 201, { ref: body.ref, object: { sha: body.sha } }), true;
     }
     if (method === 'GET' && segments.length >= 4 && segments[2] === 'heads') {
@@ -908,6 +912,7 @@ export function squashMerge(repo: Repo, pull: Pull): { ok: boolean; sha?: string
   const { oid: mergeSha, object } = buildCommit(treeOid, [baseTip], message, ident, ident);
   repo.objects.set(mergeSha, object);
   repo.refs.set(`refs/heads/${pull.baseRef}`, mergeSha);
+  touchGit(repo);
   pull.state = 'closed';
   pull.merged = true;
   pull.mergedAt = isoTime(seq);
