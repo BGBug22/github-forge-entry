@@ -273,43 +273,27 @@ export function readPack(buf: Buffer): PackReadResult {
     }
     const type = CODE_TYPE[typeCode];
     if (!type) throw new Error(`unknown pack object type ${typeCode}`);
-    // inflateSync ignores trailing bytes, so inflating the whole remainder
-    // yields this object's data; the exact consumed length comes from the
-    // minimal-prefix search below.
-    const data = zlibInflate(buf.subarray(offset, trailerStart));
+    // One inflate per object: inflateSync ignores trailing bytes, so
+    // inflating the whole remainder yields this object's data, and with
+    // { info: true } the engine reports bytesWritten, the exact number of
+    // input bytes the zlib stream consumed. That replaces the old
+    // binary-search probe (~10 throwaway inflates per object).
+    const inflated = zlibInflate(buf.subarray(offset, trailerStart), {
+      info: true,
+    }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
+    const data = inflated.buffer;
+    const consumed = inflated.engine.bytesWritten;
     if (data.length !== size) throw new Error('inflate size mismatch');
-    offset += findZlibEnd(buf, offset, trailerStart - offset);
+    if (!Number.isInteger(consumed) || consumed < 1 || consumed > trailerStart - offset) {
+      throw new Error('inflate consumed length invalid');
+    }
+    offset += consumed;
     const oid = objectId(type, data);
     objects.set(oid, { type, data });
   }
   if (offset !== trailerStart) throw new Error('pack has trailing bytes before the trailer');
   if (objects.size !== count) throw new Error('pack object count mismatch');
   return { objects, deltaCount };
-}
-
-/**
- * Find how many bytes a zlib stream starting at `offset` occupies, by
- * inflating progressively longer prefixes until the output length matches
- * the stream's own end. Uses the raw deflate block end: inflateSync throws
- * on a truncated stream, so binary-search the smallest prefix that inflates
- * cleanly to a full stream.
- */
-function findZlibEnd(buf: Buffer, offset: number, maxLen: number): number {
-  // The stream must end at or before offset+maxLen. Binary search the
-  // smallest prefix that inflates without error.
-  let lo = 1;
-  let hi = maxLen;
-  // First, the guess that worked in readPack is `guess`; the end is within it.
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    try {
-      zlibInflate(buf.subarray(offset, offset + mid));
-      hi = mid;
-    } catch {
-      lo = mid + 1;
-    }
-  }
-  return lo;
 }
 
 // ---------------------------------------------------------------------------
