@@ -1,66 +1,57 @@
-# github-forge-01 — a GitHub-compatible git forge
+# github-forge-entry — GitHub-compatible git forge (Go rebuild)
 
-[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
-[![rank](https://make.fun/badge/github-core-clone-01/BGBug22/github-forge-entry/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
-[![reward](https://make.fun/badge/github-core-clone-01/BGBug22/github-forge-entry/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+![make.fun](https://make.fun/badge/github-core-clone-01.svg)
+![rank](https://make.fun/badge/github-core-clone-01/BGBug22/github-forge-entry/rank.svg)
+![reward](https://make.fun/badge/github-core-clone-01/BGBug22/github-forge-entry/reward.svg)
 
-Live leaderboard: https://make.fun/bounty/github-core-clone-01/leaderboard
+Entry for [Build a GitHub-compatible git forge](https://make.fun/bounty/github-core-clone-01)
+on [make.fun](https://make.fun): a GitHub-compatible forge — Git Smart HTTP
+(upload-pack v2 + receive-pack v0), REST v3, GraphQL, and MCP — implemented as
+**one static Go binary** for speed, with a thin Node 22 launcher (`main.ts`).
 
-A single Node 22 process (stdlib only, no dependencies, no git binary, no
-outside service) that serves:
-
-- **Git smart HTTP** at `/{owner}/{repo}.git`: upload-pack protocol v2
-  (advertisement, ls-refs, fetch with shallow/deepen) and receive-pack v0
-  (fast-forward enforcement, per-ref `ok`/`ng` report-status).
-- **REST v3** at `/api/v3`: repositories, branches, commits, contents,
-  labels, issues, comments, pull requests, files and squash merges.
-- **GraphQL v4** at `/api/graphql`: the documents `gh` and
-  `github-mcp-server` send, including introspection, cursor pagination and
-  the issue/PR mutations.
-- **MCP** at `/mcp`: JSON-RPC 2.0 streamable HTTP, modern revision
-  2026-07-28 (`server/discover`) with the legacy `initialize` handshake as
-  a fallback, and six tools (`create_repo`, `get_repo`, `create_issue`,
-  `list_issues`, `create_pull_request`, `merge_pull_request`) that share the
-  same in-memory store as REST.
-
-Everything is in memory; state is deterministic (no wall-clock time, no
-randomness, no port in any export), so two runs fed the same requests
-produce the same state.
-
-## Run it
+## How it runs
 
 ```sh
-MAKEFUN_SHOP_TOKEN=shpat_<token> node --experimental-strip-types main.ts
+node main.ts
 ```
 
-`main.ts` is the harness lifecycle (bind an ephemeral port, register with
-`$MAKEFUN_ENV_URL`, poll `/done`, exit 0). `app.ts` builds the server.
+`main.ts` picks an ephemeral port, spawns `./forge` (the static Go binary,
+built with `CGO_ENABLED=0 go build -trimpath -ldflags "-s -w"`), registers the
+port at `$MAKEFUN_ENV_URL/register`, then long-polls `$MAKEFUN_ENV_URL/done`
+and exits 0 when the suite finishes.
+
+## The forge
+
+- **One in-memory store** serves all four surfaces, so a repo, issue, or pull
+  request created over MCP is the same object over REST and GraphQL.
+- **Git Smart HTTP**: upload-pack v2 (`ls-refs`, `fetch` with shallow/deepen),
+  receive-pack v0 (`report-status`, `side-band-64k`, `delete-refs`), packfiles
+  written plain (no deltas) and read with OFS/REF delta support; objects are
+  stored verbatim so clones round-trip byte-exact.
+- **REST v3** (`/api/v3`): repos, branches, commits, contents (each PUT is one
+  commit), labels, issues, comments, pull requests with squash merge and
+  conflict detection (405 on conflict).
+- **GraphQL** (`/api/graphql`): viewer, repository, issues/pullRequests
+  connections with cursor pagination, `__type` introspection, mutations, and
+  batched operations.
+- **MCP** (`/mcp`): JSON-RPC 2.0 Streamable HTTP, revision 2026-07-28 —
+  `server/discover`, `initialize`, and the six tools `create_repo`, `get_repo`,
+  `create_issue`, `list_issues`, `create_pull_request`, `merge_pull_request`.
+- **Determinism**: no wall clock anywhere in state — every timestamp comes
+  from `MAKEFUN_TRIAL_NOW` plus a monotonic counter, and all IDs come from
+  creation counters, so repeated runs export byte-identical state.
+- **Performance**: issues are served from pre-serialized JSON, depth-1 clone
+  packs are memoized per head commit, and all hot paths are O(1) appends or
+  hash lookups — no disk I/O, no external git binary, no network.
 
 ## Layout
 
-| File | What it is |
-| --- | --- |
-| `main.ts` | Lifecycle (kept as the starter's). |
-| `app.ts` | HTTP server: routing, Bearer auth, `/healthz`. |
-| `http-util.ts` | Request context, body reading, JSON replies. |
-| `store.ts` | In-memory store, scenario constants, deterministic clock. |
-| `git.ts` | Git objects, packfiles, pkt-lines, reachability. |
-| `git-http.ts` | Smart-HTTP handlers (advertisements, ls-refs, fetch, push). |
-| `rest.ts` | REST v3 handlers + the squash-merge engine. |
-| `graphql.ts` | GraphQL parser, schema and executor. |
-| `mcp.ts` | MCP endpoint (discover, initialize, tools). |
+- `main.ts` — Node 22 launcher (entrypoint).
+- `forge` — static linux/amd64 Go binary (the whole forge).
+- `go-src/` — Go source (`go.mod`, `main.go`, `store.go`, `git.go`,
+  `gitproto.go`, `rest.go`, `graphql.go`, `mcp.go`).
+- `package.json` — marks the repo as an ES module for `node main.ts`.
 
-## Test locally
+## License
 
-Start the server on a fixed port without the harness lifecycle, then run
-the kit's conformance runner against it:
-
-```sh
-MAKEFUN_SHOP_TOKEN=shpat_<your-test-token> \
-  node --experimental-strip-types ../test-server.ts
-node --experimental-strip-types \
-  ../../github-core-clone-01-kit/sdk/run.ts \
-  --url http://127.0.0.1:18123 --token shpat_<your-test-token>
-```
-
-Add `--perf` to also run the four benchmark workloads.
+MIT — see [LICENSE](LICENSE).
