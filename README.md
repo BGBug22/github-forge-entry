@@ -38,20 +38,18 @@ and exits 0 when the suite finishes.
   `server/discover`, `initialize`, and the six tools `create_repo`, `get_repo`,
   `create_issue`, `list_issues`, `create_pull_request`, `merge_pull_request`.
 - **Determinism**: no wall clock anywhere in state — every timestamp comes
-  from `MAKEFUN_TRIAL_NOW` plus a monotonic counter, and all IDs come from
-  creation counters, so repeated runs export byte-identical state.
-- **Performance**: issues are served from pre-serialized JSON, depth-1 clone
-  packs are memoized per head commit, and all hot paths are O(1) appends or
-  hash lookups — no disk I/O, no external git binary, no network.
+  from `MAKEFUN_TRIAL_NOW` plus a monotonic counter, so replayed runs export
+  byte-identical state.
+- **Performance**: pre-serialized issue JSON, O(1) per-repo slices, single-inflate
+  pack parsing keyed by raw SHA-1, and memoized depth-1 clone packfiles, so the
+  50 concurrent shallow clones stream the same bytes without re-traversal or
+  re-compression.
 
-## Layout
+## Build
 
-- `main.ts` — Node 22 launcher (entrypoint).
-- `forge` — static linux/amd64 Go binary (the whole forge).
-- `go-src/` — Go source (`go.mod`, `main.go`, `store.go`, `git.go`,
-  `gitproto.go`, `rest.go`, `graphql.go`, `mcp.go`).
-- `package.json` — marks the repo as an ES module for `node main.ts`.
+```sh
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o forge .
+```
 
-## License
-
-MIT — see [LICENSE](LICENSE).
+The binary is statically linked, about 5.7 MB, and needs no external git
+binary, no disk writes, and no network access at runtime.
