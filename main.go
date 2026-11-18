@@ -99,9 +99,14 @@ func main() {
 	})
 
 	port := os.Getenv("FORGE_PORT")
-	addr := "127.0.0.1:0"
+	// Bind all interfaces, not loopback only: the site harness reaches
+	// the entry via the pod IP, so a 127.0.0.1-only listener is
+	// unreachable there (v4 scored 0 on the site while grade-local,
+	// which connects via loopback, scored 975). Node's listen(port)
+	// defaults to all interfaces; Go must say so explicitly.
+	addr := ":0"
 	if port != "" {
-		addr = "127.0.0.1:" + port
+		addr = ":" + port
 	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
